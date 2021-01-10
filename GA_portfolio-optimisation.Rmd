@@ -1,0 +1,319 @@
+---
+title: 'Assignment 2: Portfolio Optimisation using GA'
+author: "Benedikt Mueller (201973906)"
+date: "18/02/2020"
+output:
+  html_document:
+    toc: true
+---
+# Load libraries
+Load packages required to run the code (note: there might be packages that require other packages and specific versions of packages. So if there occurs an error it is most likely due to the aforementioned issue. Defining max_iteration for each GA:
+```{r load libraries}
+suppressPackageStartupMessages(library("quantmod"))
+suppressPackageStartupMessages(library("GA"))
+suppressPackageStartupMessages(library("rvest"))
+#suppressPackageStartupMessages(library("ggpubr"))
+suppressPackageStartupMessages(library("tidyquant"))
+suppressPackageStartupMessages(library("fPortfolio"))
+#suppressPackageStartupMessages(library("PerformanceAnalytics"))
+suppressPackageStartupMessages(library("dplyr"))
+suppressPackageStartupMessages(library("xts"))
+suppressPackageStartupMessages(library("knitr"))
+options(warn=-1) #turn warining off
+
+max_iteration = 1000 #change value of iters per GA
+```
+
+```{r setup, include = FALSE}
+warning = FALSE
+messsage = FALSE
+```
+# Stock data
+Using "tq_index()" from "tidyquant" to get stock tickers of Stock Enviornment (here DOW):
+```{r Stock info function}
+#get stock inf of DOW stocks
+getStocks = tq_index("DOW") %>% as.data.frame()
+getStocks = subset(getStocks,symbol!="DOW")  # delete rows with no stock data for period --> "DOW"
+myStocks = gsub(pattern = '\\.', '-', getStocks$symbol) # change: BRK.B -> BRK-B (yahoo uses '-')
+orgWeights = getStocks$weight/sum(getStocks$weight) # get initial weightings - with rebalancing
+head(getStocks)
+
+```
+
+Call the function stock_data to get weekly returns of each stock in index from quantmod getSymbols and weeklyReturn (from 2015-01-01 to date). Split data in total, future (test) and train datasets (80% to 20%). The data was not tested of suitableness (e.g. normality) or log-transformed.
+```{r Stock info}
+stock_data = function(StartP,EndP) {
+Stocks = lapply(myStocks, function(sym) {
+  weeklyReturn(na.omit(getSymbols(sym, from=StartP, to=EndP, auto.assign=FALSE)))
+})
+return(Stocks)
+}
+
+Stocks = stock_data(StartP = "2015-01-01",EndP = Sys.Date())
+myDataTotal = do.call(merge.xts, Stocks)
+myDataTotal = as.data.frame(myDataTotal, col.names = myStocks); names(myDataTotal) = c(myStocks) 
+myDataTotal = myDataTotal[sapply(myDataTotal, function(myDataTotal) !any(is.na(myDataTotal)))]
+
+#create two datasets: train and test, define ratio
+nrows = length(myDataTotal[,1])-round(length(myDataTotal[,1])*0.20,0)
+myDataFuture = myDataTotal[-c(1:nrows),]
+myData = myDataTotal[c(1:nrows),]
+```
+# Setup of functions 
+Define the portfolio returns, using vectorial multiplication to enhance runtime. Returns as vectors allows plotting of results.
+Sharpe ratio as objective to realize the portfolio optimazation:
+(Note: We do not assume a risk free rate, so return of portfolio = excess return)
+```{r Functions for return and sharpe}
+portReturns = function(x,myData) {
+  myReturns = 0
+  for (i in 1:length(x)) {
+    myReturns = myReturns + myData[,i] * x[i]
+  }
+  return(myReturns)
+}
+
+portRisk = function(x,myData) {
+    myRisk = sqrt(t(x) %*% cov(myData) %*% x)
+  return(myRisk)
+}
+
+
+sharpe = function(x) {
+  myReturns = portReturns(x,myData = myData)
+  myRisk = portRisk(x,myData = myData)
+  return(sum(myReturns)/myRisk)
+}
+```
+# Sharpe Optimisation
+Define the fitness function which calls sharpe ratio (return&risk) function. Normalize weights before handing over to the other functions.
+GA settings resulted in the most stable returns. Boundaries do not allow short selling (restricted from 0-1)..
+```{r ObjSharpe function and GA}
+# sharpe optimisation
+objSharpe = function(x) {
+    x = x/sum(x)
+    return(sharpe(x=x))
+    #return (-sharpe(x=x) + 100*(sum(x != 0.00)/length(x))) #penalizing larger portfolios, did not work out as expected.
+}
+
+
+GA = ga(type="real-valued", fitness = objSharpe ,lower = rep(0,ncol(myData)), upper = rep(1,ncol(myData)), 
+        popSize=150,pmutation=1/ncol(myData),pcrossover = 0.8,maxiter = max_iteration, run=200,
+        parallel=T, monitor=F, seed = 1)
+
+#plot(GA)
+summary(GA)
+```
+..with GA summary output and optimal weights:
+```{r Optimised weights}
+
+normalWeights = summary(GA)$solution/sum(summary(GA)$solution)
+optiWeights = as.vector(normalWeights)
+TableoptiWeights = as.data.frame(cbind(names(myData),round(optiWeights,4)))
+names(TableoptiWeights) = c("Ticker","Weight")
+TableoptiWeights
+```
+## Plots of different returns
+Create random portfolio combinations and index, balanced portfolios from train dataset. Plot returns to evaluate whether the initial GA-optimised portfolio can outperform on train data...: 
+```{r Return plot on different PFs - train data}
+# create randomised portfolios
+randReturnsFunc = function(x,myData) {
+  myRands = list()
+  for (i in 1:x){
+    xRand = runif(length(myData), min=0, max=1)
+    xRand = xRand/sum(xRand)
+    myRands[[i]] = 1 + portReturns(x = xRand, myData = myData)
+  }
+  return(myRands)
+}
+#randReturns = randReturnsFunc(x=1000)
+
+# optimised, original (index) and balanced (all equally) weighted Returns
+optiReturns = 1 + portReturns(optiWeights,myData = myData)
+
+orgReturns = 1 + portReturns(orgWeights,myData = myData)
+
+balWeights = rep(1/length(myData),ncol(myData))
+balReturns = 1 + portReturns(balWeights,myData = myData)
+
+# create plot
+plot(as.Date(rownames(myData)),cumprod(optiReturns),type="l",lwd=2, col="black",
+     xlab="Date",ylab="Return",main="Return of different portfolios, train data")
+for(i in 1:length(randReturnsFunc(x=100,myData=myData))) lines(as.Date(rownames(myData)),
+                                                                cumprod(randReturnsFunc(x=100,myData=myData)[[i]]),
+                                                                col = "lightgrey", lwd=0.5, lty  = "dashed")
+lines(as.Date(rownames(myData)),cumprod(orgReturns),type="l",lwd=2, col="red")
+lines(as.Date(rownames(myData)),cumprod(balReturns),type="l",lwd=2, col="darkblue")
+legend("topleft",inset = .05,legend = c("Sharpe","Index","Balanced","Random"),
+       text.col = c("black","red","darkblue","grey"),cex=0.75)
+```
+```{r}
+```
+..and test data:
+```{r Return plot on different PFs - test data}
+plot(as.Date(rownames(myDataFuture)),cumprod(1 + portReturns(optiWeights,myData = myDataFuture)),type="l",lwd=2, col="black",
+     xlab="Date",ylab="Return",main="Return of different portfolios, test data", ylim= c(0.95,1.25))
+for(i in 1:length(randReturnsFunc(x=100,myData=myDataFuture))) lines(as.Date(rownames(myDataFuture)),
+                                                                cumprod(randReturnsFunc(x=100,myData=myDataFuture)[[i]]),
+                                                                col = "lightgrey", lwd=0.5, lty  = "dashed")
+lines(as.Date(rownames(myDataFuture)),cumprod(1 + portReturns(orgWeights,myData = myDataFuture)),type="l",lwd=2, col="red")
+lines(as.Date(rownames(myDataFuture)),cumprod(1 + portReturns(balWeights,myData = myDataFuture)),type="l",lwd=2, col="darkblue")
+legend("topleft",inset = .05,legend = c("Sharpe","Index","Balanced","Random"),
+       text.col = c("black","red","darkblue","grey"),cex=0.75)
+```
+```{r}
+```
+Evaluating the train data graphs reveals that the Sharpe PF outperforms every other selected PF (100 radomized, evenly balanced and index) by far. Not a single entity of the 100 (or even if tested with 1000) could outperform the optimized Ga-weighted PF. However, when testing on unseen data, the sharpe and index leveling off at almost the same return and some of the random PFs does indeed outperform the optimized ga PF. But since we are talking about prediction it is hard to tell whether this is caused due to a insufficient weighting or rather due to the "wrong" test period. In conclusion, the ga optimisation does what it should do: optimizing the weights given the train dataset. 
+```{r}
+```
+```{r}
+```
+# Minimun risk and max return optimisation
+Now building min variance and max return with GA. Change objective function therefore (note: min var requires to define the problem as a negative maximation, ergo add minus sign): 
+```{r Calculating MinRisk and MaxReturn PF}
+##### min var optimisation
+objMin = function(x) {
+  x = x/sum(x)
+  return(sum(portRisk(x=x,myData = myData)))
+  #return (-sharpe(x=x) + 100*(sum(x != 0.00)/length(x))) #penalizing larger portfolios
+}
+
+GAmin = ga(type="real-valued", function(x)-objMin(x),lower = rep(0,ncol(myData)), upper = rep(1,ncol(myData)), 
+        popSize=150,pmutation=1/ncol(myData),pcrossover = 0.8,maxiter = max_iteration, run=200,
+        parallel=T, monitor=F, seed = 1)
+summary(GAmin)
+
+normalWeights = summary(GAmin)$solution/sum(summary(GAmin)$solution)
+minWeights = as.vector(normalWeights)
+minReturns = 1 + portReturns(minWeights,myData = myData)
+
+
+##### max return optimisation
+objMax = function(x) {
+  x = x/sum(x)
+  return(sum(portReturns(x=x,myData = myData)))
+  #return (-sharpe(x=x) + 100*(sum(x != 0.00)/length(x))) #penalizing larger portfolios
+}
+
+GAmax = ga(type="real-valued", fitness = objMax ,lower = rep(0,ncol(myData)), upper = rep(1,ncol(myData)), 
+        popSize=150,pmutation=1/ncol(myData),pcrossover = 0.8,maxiter = max_iteration, run=200,
+        parallel=T, monitor=F, seed = 1)
+summary(GAmax)
+
+normalWeights = summary(GAmax)$solution/sum(summary(GAmax)$solution)
+maxWeights = as.vector(normalWeights)
+maxReturns = 1 + portReturns(maxWeights,myData = myData)
+```
+## Plots of different returns
+Evaluate performance, train data..:
+```{r Return plot on optimised PFs - train data}
+# plot different portfolios 
+plot(as.Date(rownames(myData)),cumprod(optiReturns),type="l",lwd=2, col="black",
+     xlab="Date",ylab="Return",main="Return of different portfolios, train data")
+lines(as.Date(rownames(myData)),cumprod(orgReturns),type="l",lwd=2, col="red")
+lines(as.Date(rownames(myData)),cumprod(balReturns),type="l",lwd=2, col="darkblue")
+lines(as.Date(rownames(myData)),cumprod(minReturns),type="l",lwd=2, col="green")
+lines(as.Date(rownames(myData)),cumprod(maxReturns),type="l",lwd=2, col="orange")
+legend("topleft",inset = .05,legend = c("Sharpe","Index","Balanced","MinVar","MaxReturn"),
+       text.col = c("black","red","darkblue","green","orange"),cex=0.75)
+```
+```{r}
+```
+...Test data..:
+```{r Return plot on optimised PFs - test data}
+# test dataset
+plot(as.Date(rownames(myDataFuture)),cumprod(1 + portReturns(optiWeights,myData = myDataFuture)),type="l",lwd=2, col="black",
+     xlab="Date",ylab="Return",main="Return of different portfolios, test data",ylim=c(0.90,1.25))
+lines(as.Date(rownames(myDataFuture)),cumprod(1 + portReturns(orgWeights,myData = myDataFuture)),type="l",lwd=2, col="red")
+lines(as.Date(rownames(myDataFuture)),cumprod(1 + portReturns(balWeights,myData = myDataFuture)),type="l",lwd=2, col="darkblue")
+lines(as.Date(rownames(myDataFuture)),cumprod(1 + portReturns(minWeights,myData = myDataFuture)),type="l",lwd=2, col="green")
+lines(as.Date(rownames(myDataFuture)),cumprod(1 + portReturns(maxWeights,myData = myDataFuture)),type="l",lwd=2, col="orange")
+legend("topleft",inset = .05,legend = c("Sharpe","Index","Balanced","MinVar","MaxReturn"),
+       text.col = c("black","red","darkblue","green","orange"),cex=0.75)
+```
+```{r}
+```
+..and combined:
+```{r Return plot on optimised PFs - total data}
+# total dataset
+plot(as.Date(rownames(myDataTotal)),cumprod(1 + portReturns(optiWeights,myData = myDataTotal)),type="l",lwd=2, col="black",
+     xlab="Date",ylab="Return",main="Return of different portfolios, total data")
+lines(as.Date(rownames(myDataTotal)),cumprod(1 + portReturns(orgWeights,myData = myDataTotal)),type="l",lwd=2, col="red")
+lines(as.Date(rownames(myDataTotal)),cumprod(1 + portReturns(balWeights,myData = myDataTotal)),type="l",lwd=2, col="darkblue")
+lines(as.Date(rownames(myDataTotal)),cumprod(1 + portReturns(minWeights,myData = myDataTotal)),type="l",lwd=2, col="green")
+lines(as.Date(rownames(myDataTotal)),cumprod(1 + portReturns(maxWeights,myData = myDataTotal)),type="l",lwd=2, col="orange")
+legend("topleft",inset = .05,legend = c("Sharpe","Index","Balanced","MinVar","MaxReturn"),
+       text.col = c("black","red","darkblue","green","orange"),cex=0.75)
+```
+```{r}
+```
+The sharpe portfolio outperformed every other portfolio when looking at the total dataset (starting from to 2015-01-01). The weightings can even outperform the maximisation of returns (MaxReturn). The pictures itself shows that the ga does a pretty good job and that the results are reasonable (e.g. MinVar PF lowest returns & sharpe PF close to Efficent Frontier). Unfortunetly, on the unseen data, the sharpe otimisation is just as good as (slightly worse) the initial index. Yet, it gains higher rewards as the MaxReturn PF as well as seems to lower the volatility. 
+```{r}
+```
+```{r}
+```
+# Efficent Frontiers
+Now calculating the risk/return ratio and plot all portfolios on mean-variance plot. Get the Efficent frontier from "fPortfolio", train and test dataset:
+```{r Efficent Frontier plot}
+
+# calculate & plot efficient frontier
+PlotEff = function(myDataSource){
+  effFrontier = portfolioFrontier(as.timeSeries(myDataSource), constraints = "LongOnly")
+  plot(effFrontier,c(1)) # c(1,2,5)
+  points(x=portRisk(optiWeights,myData = myDataSource)/length(portRisk(optiWeights,myData = myDataSource)),
+         y=sum(portReturns(optiWeights,myData = myDataSource)/length(portReturns(optiWeights,myData = myDataSource))),
+         col="black",pch=8,cex=1)
+  points(x=portRisk(orgWeights,myData = myDataSource)/length(portRisk(orgWeights,myData = myDataSource)),
+         y=sum(portReturns(orgWeights,myData = myDataSource)/length(portReturns(orgWeights,myData = myDataSource))),
+         col="red",pch=16,cex=1)
+  points(x=portRisk(balWeights,myData = myDataSource)/length(portRisk(balWeights,myData = myDataSource)),
+         y=sum(portReturns(balWeights,myData = myDataSource)/length(portReturns(balWeights,myData = myDataSource))),
+         col="darkblue",pch=16,cex=1)
+  points(x=portRisk(minWeights,myData = myDataSource)/length(portRisk(minWeights,myData = myDataSource)),
+         y=sum(portReturns(minWeights,myData = myDataSource)/length(portReturns(minWeights,myData = myDataSource))),
+         col="green",pch=16,cex=1)
+  points(x=portRisk(maxWeights,myData = myDataSource)/length(portRisk(maxWeights,myData = myDataSource)),
+         y=sum(portReturns(maxWeights,myData = myDataSource)/length(portReturns(maxWeights,myData = myDataSource))),
+         col="orange",pch=16,cex=1)
+  legend("right",title = deparse(substitute(myDataSource)), legend = c("Sharpe","Index","Balanced","MinVar","MaxReturn"), bty = "n",
+         lwd = 1, cex = 0.75, col = c("black","red","darkblue","green","orange"), lty = c(rep(NA,5)), pch = c(8, rep(16,4)))
+}
+#select dataset
+PlotEff(myDataSource = myData)
+PlotEff(myDataSource = myDataFuture)
+```
+```{r}
+```
+At least for the train data, the results approx. match with the results of fPortfolio: MinVar Portfolio is very close to where it belongs, the Sharpe Portfolio lies close to the Efficent frontier. The MaxRetrun PF has the highest risk. The Ga seems to generate reasonable results!!! Since predicting future stock prices includes a vast of other factors than just chosing the "right" weights, the results are not contrary to the assumption that overall, the Ga does a decent work.
+```{r}
+```
+## Risk/Return tables
+Finally, see all values in the tables below: 
+```{r Data tables}
+# train & test datasets
+
+DataFrameEff = function(myDataSource){
+  Riskmeasures = c(portRisk(optiWeights,myData = myDataSource),
+                   portRisk(orgWeights,myData = myDataSource),
+                   portRisk(balWeights,myData = myDataSource),
+                   portRisk(minWeights,myData = myDataSource),
+                   portRisk(maxWeights,myData = myDataSource))
+  Returnmeasures = c(sum(portReturns(optiWeights,myData = myDataSource)),
+                     sum(portReturns(orgWeights,myData = myDataSource)),
+                     sum(portReturns(balWeights,myData = myDataSource)),
+                     sum(portReturns(minWeights,myData = myDataSource)),
+                     sum(portReturns(maxWeights,myData = myDataSource)))
+                     
+  data.frame("PF" = c("Sharpe","Index","Balanced","MinVar","MaxReturn"), "Risk - total" = Riskmeasures, "Return - total" = Returnmeasures,
+             stringsAsFactors = FALSE)
+}
+
+kable(DataFrameEff(myDataSource = myData), caption = "Train dataset")
+
+kable(DataFrameEff(myDataSource = myDataFuture), caption = "Test dataset")
+```
+
+
+```{r,echo = FALSE}
+options(warn=0)
+```
+
